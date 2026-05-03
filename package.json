@@ -1,7 +1,6 @@
 {
   "name": "yt-live-tracker",
-  "version": "1.0.0",
-  "description": "YouTube 10-minute live video tracker via PubSub",
+  "version": "2.0.0",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
