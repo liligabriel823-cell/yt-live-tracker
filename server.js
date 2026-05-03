@@ -1,9 +1,3 @@
-// ============================================================
-//  YouTube Live Tracker — Server
-//  Deploy on Glitch.com (free)
-//  Receives YouTube PubSub push notifications instantly
-// ============================================================
-
 const express  = require('express');
 const cors     = require('cors');
 const xml2js   = require('xml2js');
@@ -12,22 +6,22 @@ const fetch    = require('node-fetch');
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
-// ── In-memory stores ─────────────────────────────────────────
-//  videos   : { videoId → { videoId, channelId, channelName, title, url, thumb, publishedAt, expiresAt } }
-//  channels : { channelId → { channelId, name, subscribedAt } }
-//  logs     : last 50 events for debugging
-
-const videos   = new Map();   // live videos (auto-expire 10 min)
-const channels = new Map();   // tracked channels
+const videos   = new Map();
+const channels = new Map();
 const logs     = [];
-
-const TEN_MIN  = 10 * 60 * 1000;   // ms
+const TEN_MIN  = 10 * 60 * 1000;
 const LOG_MAX  = 50;
 
-// ── Middleware ────────────────────────────────────────────────
-app.use(cors({ origin: '*' }));
-app.use(express.text({ type: 'application/atom+xml', limit: '2mb' }));
-app.use(express.text({ type: 'text/xml',             limit: '2mb' }));
+// ── CORS — allow all origins ──────────────────────────────────
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET,POST,DELETE,OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  next();
+});
+
+app.use(express.text({ type: ['application/atom+xml','text/xml','application/xml'], limit: '2mb' }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -47,14 +41,14 @@ function cleanExpired() {
   }
 }
 
-// Clean every 60 seconds
 setInterval(cleanExpired, 60_000);
 
-// ── YouTube PubSub Subscription ───────────────────────────────
+// ── PubSub Subscribe ──────────────────────────────────────────
 const PUBSUB_HUB = 'https://pubsubhubbub.appspot.com/subscribe';
 
 async function subscribeChannel(channelId) {
-  const callbackUrl = `${process.env.SERVER_URL || `https://${process.env.PROJECT_DOMAIN}.glitch.me`}/pubsub`;
+  const serverUrl   = process.env.SERVER_URL || `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`;
+  const callbackUrl = `${serverUrl}/pubsub`;
   const topicUrl    = `https://www.youtube.com/xml/feeds/videos.xml?channel_id=${channelId}`;
 
   const params = new URLSearchParams({
@@ -62,7 +56,7 @@ async function subscribeChannel(channelId) {
     'hub.topic'         : topicUrl,
     'hub.verify'        : 'async',
     'hub.mode'          : 'subscribe',
-    'hub.lease_seconds' : '432000',   // 5 days — re-subscribe before expiry
+    'hub.lease_seconds' : '432000',
   });
 
   try {
@@ -70,11 +64,10 @@ async function subscribeChannel(channelId) {
     if (r.status === 202) {
       addLog(`Subscribed: ${channelId}`);
       return { ok: true };
-    } else {
-      const text = await r.text();
-      addLog(`Subscribe failed ${channelId}: ${r.status} ${text}`);
-      return { ok: false, error: text };
     }
+    const text = await r.text();
+    addLog(`Subscribe failed ${channelId}: ${r.status} ${text}`);
+    return { ok: false, error: text };
   } catch (e) {
     addLog(`Subscribe error ${channelId}: ${e.message}`);
     return { ok: false, error: e.message };
@@ -82,72 +75,65 @@ async function subscribeChannel(channelId) {
 }
 
 async function unsubscribeChannel(channelId) {
-  const callbackUrl = `${process.env.SERVER_URL || `https://${process.env.PROJECT_DOMAIN}.glitch.me`}/pubsub`;
+  const serverUrl   = process.env.SERVER_URL || `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`;
+  const callbackUrl = `${serverUrl}/pubsub`;
   const topicUrl    = `https://www.youtube.com/xml/feeds/videos.xml?channel_id=${channelId}`;
-
   const params = new URLSearchParams({
     'hub.callback' : callbackUrl,
     'hub.topic'    : topicUrl,
     'hub.verify'   : 'async',
     'hub.mode'     : 'unsubscribe',
   });
-
   try {
     await fetch(PUBSUB_HUB, { method: 'POST', body: params });
     addLog(`Unsubscribed: ${channelId}`);
   } catch (e) {
-    addLog(`Unsubscribe error ${channelId}: ${e.message}`);
+    addLog(`Unsubscribe error: ${e.message}`);
   }
 }
 
-// Auto re-subscribe every 4 days (before 5-day lease expires)
+// Re-subscribe every 4 days
 setInterval(async () => {
   addLog(`Re-subscribing ${channels.size} channels...`);
   for (const channelId of channels.keys()) {
     await subscribeChannel(channelId);
-    await new Promise(r => setTimeout(r, 200)); // small delay
+    await new Promise(r => setTimeout(r, 300));
   }
 }, 4 * 24 * 60 * 60 * 1000);
 
 // ── PubSub Webhook ────────────────────────────────────────────
-
-// GET — YouTube verifies subscription
 app.get('/pubsub', (req, res) => {
   const challenge = req.query['hub.challenge'];
   if (challenge) {
-    addLog(`Verification challenge received`);
+    addLog(`Verification OK`);
     return res.send(challenge);
   }
   res.sendStatus(200);
 });
 
-// POST — YouTube sends new video notification
 app.post('/pubsub', async (req, res) => {
-  res.sendStatus(200); // acknowledge immediately
-
+  res.sendStatus(200);
   try {
     const body = req.body;
     if (!body) return;
 
     const parser = new xml2js.Parser({ explicitArray: false });
     const parsed = await parser.parseStringPromise(body);
+    const entry  = parsed?.feed?.entry;
+    if (!entry) return;
 
-    const entry = parsed?.feed?.entry;
-    if (!entry) return; // deletion notification, ignore
-
-    const videoId   = entry['yt:videoId']   || entry.id?.replace('yt:video:', '');
-    const channelId = entry['yt:channelId'] || entry.author?.uri?.split('/channel/')[1];
-    const title     = entry.title;
-    const published = entry.published;
-    const updated   = entry.updated;
+    const videoId   = entry['yt:videoId']   || '';
+    const channelId = entry['yt:channelId'] || entry.author?.uri?.split('/channel/')[1] || '';
+    const title     = entry.title || 'Untitled';
+    const published = entry.published || new Date().toISOString();
+    const updated   = entry.updated   || published;
 
     if (!videoId) return;
 
-    // Only care about NEW videos (published ≈ updated = new upload)
-    // If updated >> published it's just a title/desc edit — ignore
+    // Ignore edits — only new uploads
     const pubTime = new Date(published).getTime();
     const updTime = new Date(updated).getTime();
-    if (updTime - pubTime > 5 * 60 * 1000) return; // edit, not new upload
+    if (updTime - pubTime > 5 * 60 * 1000) return;
 
     const channelInfo = channels.get(channelId) || { channelId, name: channelId };
 
@@ -155,16 +141,16 @@ app.post('/pubsub', async (req, res) => {
       videoId,
       channelId,
       channelName : channelInfo.name || channelId,
-      title       : title || 'Untitled',
+      title,
       url         : `https://www.youtube.com/watch?v=${videoId}`,
       thumb       : `https://img.youtube.com/vi/${videoId}/mqdefault.jpg`,
-      publishedAt : published || new Date().toISOString(),
+      publishedAt : published,
       receivedAt  : new Date().toISOString(),
       expiresAt   : Date.now() + TEN_MIN,
     };
 
     videos.set(videoId, video);
-    addLog(`NEW VIDEO: [${channelInfo.name}] ${title?.slice(0, 60)}`);
+    addLog(`NEW: [${channelInfo.name}] ${title.slice(0, 60)}`);
 
   } catch (e) {
     addLog(`Parse error: ${e.message}`);
@@ -172,17 +158,13 @@ app.post('/pubsub', async (req, res) => {
 });
 
 // ── API: Channels ─────────────────────────────────────────────
-
-// GET all channels
 app.get('/api/channels', (req, res) => {
   res.json([...channels.values()]);
 });
 
-// POST add channel
 app.post('/api/channels', async (req, res) => {
   const { channelId, name } = req.body;
   if (!channelId) return res.status(400).json({ error: 'channelId required' });
-
   if (channels.has(channelId)) return res.status(409).json({ error: 'Already tracked' });
 
   const entry = { channelId, name: name || channelId, subscribedAt: new Date().toISOString() };
@@ -193,57 +175,43 @@ app.post('/api/channels', async (req, res) => {
     channels.delete(channelId);
     return res.status(500).json({ error: 'Subscribe failed: ' + result.error });
   }
-
   res.json({ ok: true, channel: entry });
 });
 
-// DELETE remove channel
 app.delete('/api/channels/:channelId', async (req, res) => {
   const { channelId } = req.params;
   if (!channels.has(channelId)) return res.status(404).json({ error: 'Not found' });
-
   channels.delete(channelId);
-  // Remove that channel's videos too
   for (const [vid, v] of videos) {
     if (v.channelId === channelId) videos.delete(vid);
   }
-
   await unsubscribeChannel(channelId);
   res.json({ ok: true });
 });
 
-// POST bulk add channels
 app.post('/api/channels/bulk', async (req, res) => {
-  const { channels: list } = req.body; // [{channelId, name}]
+  const { channels: list } = req.body;
   if (!Array.isArray(list)) return res.status(400).json({ error: 'channels array required' });
 
   const results = { added: 0, skipped: 0, errors: [] };
-
   for (const item of list) {
     const { channelId, name } = item;
     if (!channelId) continue;
     if (channels.has(channelId)) { results.skipped++; continue; }
-
     channels.set(channelId, { channelId, name: name || channelId, subscribedAt: new Date().toISOString() });
     const r = await subscribeChannel(channelId);
-    if (r.ok) {
-      results.added++;
-    } else {
-      channels.delete(channelId);
-      results.errors.push({ channelId, error: r.error });
-    }
-
-    await new Promise(r => setTimeout(r, 150)); // avoid rate limit
+    if (r.ok) { results.added++; }
+    else { channels.delete(channelId); results.errors.push({ channelId, error: r.error }); }
+    await new Promise(r => setTimeout(r, 150));
   }
-
   res.json(results);
 });
 
-// ── API: Videos (live 10-min window) ─────────────────────────
+// ── API: Videos ───────────────────────────────────────────────
 app.get('/api/videos', (req, res) => {
   cleanExpired();
-  const now   = Date.now();
-  const list  = [...videos.values()]
+  const now  = Date.now();
+  const list = [...videos.values()]
     .filter(v => v.expiresAt > now)
     .map(v => ({
       ...v,
@@ -251,11 +219,10 @@ app.get('/api/videos', (req, res) => {
       ageSeconds  : Math.floor((now - new Date(v.receivedAt).getTime()) / 1000),
     }))
     .sort((a, b) => new Date(b.receivedAt) - new Date(a.receivedAt));
-
   res.json({ count: list.length, videos: list });
 });
 
-// ── API: Stats & Logs ─────────────────────────────────────────
+// ── API: Stats ────────────────────────────────────────────────
 app.get('/api/stats', (req, res) => {
   cleanExpired();
   res.json({
@@ -266,7 +233,7 @@ app.get('/api/stats', (req, res) => {
   });
 });
 
-// ── Health check ──────────────────────────────────────────────
+// ── Root ──────────────────────────────────────────────────────
 app.get('/', (req, res) => {
   res.json({
     status   : 'running',
